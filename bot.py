@@ -1,14 +1,8 @@
 """
 Telegram-бот-конвертер файлов.
 
-Возможности:
-- Конвертация картинок: JPG / PNG / WEBP
-- Сжатие картинок
-- Несколько картинок -> один PDF
-- Извлечение текста из PDF
-- DOCX -> PDF (точно, через LibreOffice)
-
-Навигация: сначала выбираешь функцию в меню, потом бот просит прислать файл.
+Навигация через reply-клавиатуру (кнопки у поля ввода, в два столбца).
+Сначала выбираешь функцию, потом бот просит прислать файл.
 
 Токен берётся из переменной окружения TELEGRAM_TOKEN.
 """
@@ -26,9 +20,8 @@ from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
-    CallbackQuery,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
+    KeyboardButton,
+    ReplyKeyboardMarkup,
 )
 from aiohttp import web
 from PIL import Image
@@ -47,13 +40,32 @@ logging.basicConfig(level=logging.INFO)
 bot = Bot(token=TELEGRAM_TOKEN)
 dp = Dispatcher()
 
-# Какую функцию пользователь выбрал и ждёт файл: {user_id: action}
 pending_action: dict[int, str] = {}
-
-# Учёт дневного лимита: {user_id: (дата, количество)}
 usage_tracker: dict[int, tuple[date, int]] = {}
 
-# Соответствие действия -> какой тип файла ожидается и текст-подсказка
+# Подписи кнопок -> внутренний код действия
+BTN_PNG = "🖼 В PNG"
+BTN_JPG = "🖼 В JPG"
+BTN_WEBP = "🖼 В WEBP"
+BTN_COMPRESS = "🗜 Сжать картинку"
+BTN_IMG_TO_PDF = "📄 Картинка → PDF"
+BTN_PDF_TEXT = "📝 Извлечь текст из PDF"
+BTN_DOCX_TO_PDF = "📝 DOCX → PDF"
+BTN_SUBSCRIPTION = "💎 Подписка"
+BTN_BACK = "◀️ Назад"
+BTN_TARIFFS = "💰 Тарифы"
+BTN_BUY = "✅ Купить"
+
+BUTTON_TO_ACTION = {
+    BTN_PNG: "img_png",
+    BTN_JPG: "img_jpg",
+    BTN_WEBP: "img_webp",
+    BTN_COMPRESS: "img_compress",
+    BTN_IMG_TO_PDF: "img_to_pdf",
+    BTN_PDF_TEXT: "pdf_text",
+    BTN_DOCX_TO_PDF: "docx_to_pdf",
+}
+
 ACTION_INFO = {
     "img_png": ("image", "Пришли картинку — сконвертирую в PNG."),
     "img_jpg": ("image", "Пришли картинку — сконвертирую в JPG."),
@@ -99,60 +111,44 @@ def convert_docx_to_pdf_bytes(docx_bytes: bytes) -> bytes | None:
             return f.read()
 
 
-# ==== Клавиатуры ====
+# ==== Reply-клавиатуры (кнопки у поля ввода, в два столбца) ====
 
-def main_menu_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(text="🖼 В PNG", callback_data="select_img_png"),
-                InlineKeyboardButton(text="🖼 В JPG", callback_data="select_img_jpg"),
-                InlineKeyboardButton(text="🖼 В WEBP", callback_data="select_img_webp"),
-            ],
-            [
-                InlineKeyboardButton(text="🗜 Сжать картинку", callback_data="select_img_compress"),
-                InlineKeyboardButton(text="📄 Картинка → PDF", callback_data="select_img_to_pdf"),
-            ],
-            [
-                InlineKeyboardButton(text="📝 Извлечь текст из PDF", callback_data="select_pdf_text"),
-            ],
-            [
-                InlineKeyboardButton(text="📝 DOCX → PDF (точно)", callback_data="select_docx_to_pdf"),
-            ],
-            [
-                InlineKeyboardButton(text="💎 Подписка", callback_data="show_subscription"),
-            ],
-        ]
+def main_menu_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[
+            [KeyboardButton(text=BTN_PNG), KeyboardButton(text=BTN_JPG)],
+            [KeyboardButton(text=BTN_WEBP), KeyboardButton(text=BTN_COMPRESS)],
+            [KeyboardButton(text=BTN_IMG_TO_PDF), KeyboardButton(text=BTN_PDF_TEXT)],
+            [KeyboardButton(text=BTN_DOCX_TO_PDF), KeyboardButton(text=BTN_SUBSCRIPTION)],
+        ],
+        resize_keyboard=True,
     )
 
 
-def waiting_for_file_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[[InlineKeyboardButton(text="◀️ Назад в меню", callback_data="back_to_menu")]]
+def waiting_for_file_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=BTN_BACK)]],
+        resize_keyboard=True,
     )
 
 
-def subscription_info_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="💰 Тарифы", callback_data="show_tariffs")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="back_to_menu")],
-        ]
+def subscription_info_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=BTN_TARIFFS)], [KeyboardButton(text=BTN_BACK)]],
+        resize_keyboard=True,
     )
 
 
-def tariffs_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [InlineKeyboardButton(text="✅ Купить", callback_data="buy_subscription")],
-            [InlineKeyboardButton(text="◀️ Назад", callback_data="show_subscription")],
-        ]
+def tariffs_keyboard() -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=BTN_BUY)], [KeyboardButton(text=BTN_BACK)]],
+        resize_keyboard=True,
     )
 
 
 MAIN_MENU_TEXT = (
     "Привет! 👋 Я конвертирую файлы.\n\n"
-    "Выбери функцию из меню ниже — потом пришлю запрос на файл.\n\n"
+    "Выбери функцию на клавиатуре ниже — потом пришлю запрос на файл.\n\n"
     f"Лимит: {DAILY_LIMIT} конвертаций в день бесплатно."
 )
 
@@ -173,7 +169,13 @@ TARIFFS_TEXT = (
 )
 
 
-# ==== Хендлеры меню ====
+async def download_file_bytes(file_id: str) -> bytes:
+    file = await bot.get_file(file_id)
+    file_bytes = await bot.download_file(file.file_path)
+    return file_bytes.read()
+
+
+# ==== Команды и меню ====
 
 @dp.message(Command("start"))
 async def cmd_start(message: types.Message):
@@ -181,50 +183,37 @@ async def cmd_start(message: types.Message):
     await message.answer(MAIN_MENU_TEXT, reply_markup=main_menu_keyboard())
 
 
-@dp.callback_query(F.data == "back_to_menu")
-async def back_to_menu(callback: CallbackQuery):
-    pending_action.pop(callback.from_user.id, None)
-    await callback.answer()
-    await callback.message.edit_text(MAIN_MENU_TEXT, reply_markup=main_menu_keyboard())
+@dp.message(F.text == BTN_SUBSCRIPTION)
+async def show_subscription(message: types.Message):
+    await message.answer(SUBSCRIPTION_INFO_TEXT, reply_markup=subscription_info_keyboard())
 
 
-@dp.callback_query(F.data == "show_subscription")
-async def show_subscription(callback: CallbackQuery):
-    await callback.answer()
-    await callback.message.edit_text(SUBSCRIPTION_INFO_TEXT, reply_markup=subscription_info_keyboard())
+@dp.message(F.text == BTN_TARIFFS)
+async def show_tariffs(message: types.Message):
+    await message.answer(TARIFFS_TEXT, reply_markup=tariffs_keyboard())
 
 
-@dp.callback_query(F.data == "show_tariffs")
-async def show_tariffs(callback: CallbackQuery):
-    await callback.answer()
-    await callback.message.edit_text(TARIFFS_TEXT, reply_markup=tariffs_keyboard())
-
-
-@dp.callback_query(F.data == "buy_subscription")
-async def buy_subscription(callback: CallbackQuery):
-    await callback.answer(
-        "Оплата пока не настроена, функция в разработке. Следите за обновлениями!",
-        show_alert=True,
+@dp.message(F.text == BTN_BUY)
+async def buy_subscription(message: types.Message):
+    await message.answer(
+        "Оплата пока не настроена, функция в разработке. Следите за обновлениями!"
     )
 
 
-@dp.callback_query(F.data.startswith("select_"))
-async def select_action(callback: CallbackQuery):
-    action = callback.data.removeprefix("select_")
-    file_kind, prompt_text = ACTION_INFO[action]
-    pending_action[callback.from_user.id] = action
+@dp.message(F.text == BTN_BACK)
+async def go_back(message: types.Message):
+    pending_action.pop(message.from_user.id, None)
+    await message.answer(MAIN_MENU_TEXT, reply_markup=main_menu_keyboard())
 
-    await callback.answer()
-    await callback.message.edit_text(prompt_text, reply_markup=waiting_for_file_keyboard())
+
+@dp.message(F.text.in_(BUTTON_TO_ACTION.keys()))
+async def select_action(message: types.Message):
+    action = BUTTON_TO_ACTION[message.text]
+    pending_action[message.from_user.id] = action
+    await message.answer(ACTION_INFO[action][1], reply_markup=waiting_for_file_keyboard())
 
 
 # ==== Обработка присланных файлов ====
-
-async def download_file_bytes(file_id: str) -> bytes:
-    file = await bot.get_file(file_id)
-    file_bytes = await bot.download_file(file.file_path)
-    return file_bytes.read()
-
 
 @dp.message(F.photo | (F.document & F.document.mime_type.startswith("image/")))
 async def handle_image_upload(message: types.Message):
@@ -364,9 +353,9 @@ async def handle_docx_upload(message: types.Message):
 @dp.message()
 async def handle_other(message: types.Message):
     if message.from_user.id not in pending_action:
-        await message.answer("Напиши /start, чтобы открыть меню.")
+        await message.answer("Напиши /start, чтобы открыть меню.", reply_markup=main_menu_keyboard())
     else:
-        await message.answer("Пришли файл нужного типа для выбранной функции, либо нажми «Назад в меню».")
+        await message.answer("Пришли файл нужного типа для выбранной функции, либо нажми «Назад».")
 
 
 # ==== Веб-сервер для Render (health check) ====
