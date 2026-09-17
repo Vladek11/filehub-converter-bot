@@ -33,6 +33,7 @@ TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 MAX_FILE_SIZE_MB = 20
 DAILY_LIMIT = 15
 PORT = int(os.environ.get("PORT", 8080))
+UNLIMITED_USER_IDS = {1745647417}  # владелец бота — без дневного лимита
 # ====================
 
 logging.basicConfig(level=logging.INFO)
@@ -78,6 +79,8 @@ ACTION_INFO = {
 
 
 def check_and_increment_limit(user_id: int) -> bool:
+    if user_id in UNLIMITED_USER_IDS:
+        return True
     today = date.today()
     last_date, count = usage_tracker.get(user_id, (today, 0))
     if last_date != today:
