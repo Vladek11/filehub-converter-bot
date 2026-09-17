@@ -1,0 +1,5 @@
+aiogram==3.31.0
+aiohttp==3.14.3
+Pillow
+pypdf
+img2pdf
