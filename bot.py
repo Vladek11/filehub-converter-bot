@@ -21,11 +21,12 @@ import logging
 import os
 import subprocess
 import tempfile
+import time
 import uuid
 from datetime import date, timedelta
 
 import aiohttp
-from aiogram import Bot, Dispatcher, F, types
+from aiogram import BaseMiddleware, Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import (
     BufferedInputFile,
@@ -80,6 +81,34 @@ async def redis_command(*args) -> any:
         async with session.post(REDIS_URL, headers=headers, json=list(args)) as response:
             data = await response.json()
             return data.get("result")
+
+
+# ==== Сбор статистики (для команды /admin) ====
+
+async def track_user(user_id: int):
+    """Вызывается на каждое сообщение — обновляет статистику по пользователям."""
+    today_key = date.today().isoformat()
+
+    added_to_all = await redis_command("SADD", "users:all", str(user_id))
+    if added_to_all == 1:
+        await redis_command("SADD", f"users:new:{today_key}", str(user_id))
+        await redis_command("EXPIRE", f"users:new:{today_key}", "172800")
+
+    await redis_command("SADD", f"users:today:{today_key}", str(user_id))
+    await redis_command("EXPIRE", f"users:today:{today_key}", "172800")
+
+    now_ts = int(time.time())
+    await redis_command("ZADD", "users:last_seen", str(now_ts), str(user_id))
+
+
+class TrackUserMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        if event.from_user:
+            await track_user(event.from_user.id)
+        return await handler(event, data)
+
+
+dp.message.middleware(TrackUserMiddleware())
 
 
 async def get_user_tier(user_id: int) -> str:
@@ -420,6 +449,40 @@ async def grant_subscription_to_user(message: types.Message):
     await message.answer(f"Готово: пользователю {target_user_id} выдан тариф {tier} на {days} дн.")
 
 
+@dp.message(Command("admin"))
+async def show_admin_stats(message: types.Message):
+    """Статистика бота — только для владельца."""
+    if message.from_user.id not in OWNER_IDS:
+        return
+
+    today_key = date.today().isoformat()
+    now_ts = int(time.time())
+    active_window_start = now_ts - 300  # активны за последние 5 минут
+
+    total_users = await redis_command("SCARD", "users:all") or 0
+    today_users = await redis_command("SCARD", f"users:today:{today_key}") or 0
+    new_today = await redis_command("SCARD", f"users:new:{today_key}") or 0
+    active_now = await redis_command("ZCOUNT", "users:last_seen", str(active_window_start), "+inf") or 0
+
+    sub_keys = await redis_command("KEYS", "sub:*")
+    subs_count = len(sub_keys) if sub_keys else 0
+
+    stars_total = await redis_command("GET", "stats:stars_total") or "0"
+    payments_total = await redis_command("GET", "stats:payments_total") or "0"
+
+    text = (
+        "📊 Статистика бота\n\n"
+        f"👥 Всего: {total_users}\n"
+        f"🟢 Активны: {active_now}\n"
+        f"📅 Сегодня: {today_users}\n"
+        f"📈 Новых сегодня: {new_today}\n\n"
+        f"💳 Активных подписок: {subs_count}\n"
+        f"🧾 Оплат всего: {payments_total}\n"
+        f"⭐ Получено звёзд: {stars_total}"
+    )
+    await message.answer(text)
+
+
 @dp.message(F.text == BTN_SUBSCRIPTION)
 async def show_subscription(message: types.Message):
     await message.answer(SUBSCRIPTION_INFO_TEXT, reply_markup=subscription_info_keyboard())
@@ -471,7 +534,12 @@ async def process_pre_checkout(pre_checkout: PreCheckoutQuery):
 async def process_successful_payment(message: types.Message):
     payload = message.successful_payment.invoice_payload
     tier = payload.replace("sub_", "")
+    stars_amount = message.successful_payment.total_amount  # для Stars — это и есть кол-во звёзд
+
     await grant_subscription(message.from_user.id, tier)
+    await redis_command("INCRBY", "stats:stars_total", str(stars_amount))
+    await redis_command("INCR", "stats:payments_total")
+
     tier_name = "Premium 💎" if tier == "premium" else "VIP 👑"
     await message.answer(
         f"Спасибо за покупку! Подписка {tier_name} активна на {SUBSCRIPTION_DAYS} дней. 🎉",
