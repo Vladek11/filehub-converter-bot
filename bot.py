@@ -94,6 +94,21 @@ async def get_user_tier(user_id: int) -> str:
     return "free"
 
 
+async def get_user_tier_with_days_left(user_id: int) -> tuple[str, int | None]:
+    """Возвращает (тариф, сколько дней осталось). Для free или владельца — (tier, None)."""
+    if user_id in OWNER_IDS:
+        return "vip", None
+    raw = await redis_command("GET", f"sub:{user_id}")
+    if not raw:
+        return "free", None
+    sub = json.loads(raw)
+    expires = date.fromisoformat(sub["expires"])
+    days_left = (expires - date.today()).days
+    if days_left < 0:
+        return "free", None
+    return sub["tier"], days_left
+
+
 async def grant_subscription(user_id: int, tier: str):
     expires = date.today() + timedelta(days=SUBSCRIPTION_DAYS)
     value = json.dumps({"tier": tier, "expires": expires.isoformat()})
@@ -296,11 +311,17 @@ def tariffs_keyboard() -> ReplyKeyboardMarkup:
 
 
 async def main_menu_text(user_id: int) -> str:
-    tier = await get_user_tier(user_id)
+    tier, days_left = await get_user_tier_with_days_left(user_id)
     tier_names = {"free": "Бесплатный", "premium": "Premium 💎", "vip": "VIP 👑"}
+    tier_line = f"Твой тариф: {tier_names[tier]}"
+    if days_left is not None:
+        word = "день" if days_left % 10 == 1 and days_left % 100 != 11 else (
+            "дня" if 2 <= days_left % 10 <= 4 and not (12 <= days_left % 100 <= 14) else "дней"
+        )
+        tier_line += f" (осталось {days_left} {word})"
     return (
         "Привет! 👋 Я конвертирую файлы.\n\n"
-        f"Твой тариф: {tier_names[tier]}\n"
+        f"{tier_line}\n"
         "Выбери функцию на клавиатуре ниже.\n\n"
         "🎬 Видео→аудио, 🎵 аудио, 📚 объединение PDF и 🔍 OCR — платные функции (жми «💎 Подписка», чтобы узнать больше)."
     )
