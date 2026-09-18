@@ -109,11 +109,11 @@ async def get_user_tier_with_days_left(user_id: int) -> tuple[str, int | None]:
     return sub["tier"], days_left
 
 
-async def grant_subscription(user_id: int, tier: str):
-    expires = date.today() + timedelta(days=SUBSCRIPTION_DAYS)
+async def grant_subscription(user_id: int, tier: str, days: int = SUBSCRIPTION_DAYS):
+    expires = date.today() + timedelta(days=days)
     value = json.dumps({"tier": tier, "expires": expires.isoformat()})
     # ключ живёт чуть дольше самой подписки — просто с запасом
-    await redis_command("SET", f"sub:{user_id}", value, "EX", str(SUBSCRIPTION_DAYS * 86400 + 86400))
+    await redis_command("SET", f"sub:{user_id}", value, "EX", str(days * 86400 + 86400))
 
 
 async def check_and_increment_limit(user_id: int, kind: str, daily_limit: int) -> bool:
@@ -380,6 +380,44 @@ async def test_grant_subscription(message: types.Message):
 
     await grant_subscription(message.from_user.id, tier)
     await message.answer(f"Тестовая подписка {tier} выдана на {SUBSCRIPTION_DAYS} дней (в Redis).")
+
+
+@dp.message(Command("grant"))
+async def grant_subscription_to_user(message: types.Message):
+    """Команда только для владельца — выдаёт подписку любому пользователю
+    на любой срок (например, в подарок или по договорённости).
+    Использование: /grant <user_id> <premium|vip> <дней>
+    Пример: /grant 987654321 vip 7"""
+    if message.from_user.id not in OWNER_IDS:
+        return
+
+    parts = message.text.split()
+    if len(parts) != 4:
+        await message.answer(
+            "Использование: /grant <user_id> <premium|vip> <дней>\n"
+            "Пример: /grant 987654321 vip 7"
+        )
+        return
+
+    _, user_id_str, tier, days_str = parts
+
+    if tier not in ("premium", "vip"):
+        await message.answer("Тариф должен быть premium или vip.")
+        return
+
+    try:
+        target_user_id = int(user_id_str)
+        days = int(days_str)
+    except ValueError:
+        await message.answer("user_id и количество дней должны быть числами.")
+        return
+
+    if days <= 0:
+        await message.answer("Количество дней должно быть больше нуля.")
+        return
+
+    await grant_subscription(target_user_id, tier, days)
+    await message.answer(f"Готово: пользователю {target_user_id} выдан тариф {tier} на {days} дн.")
 
 
 @dp.message(F.text == BTN_SUBSCRIPTION)
