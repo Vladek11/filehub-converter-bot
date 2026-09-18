@@ -118,19 +118,24 @@ async def get_user_tier(user_id: int) -> str:
     if not raw:
         return "free"
     sub = json.loads(raw)
+    if sub["expires"] == "lifetime":
+        return sub["tier"]
     if date.fromisoformat(sub["expires"]) >= date.today():
         return sub["tier"]
     return "free"
 
 
 async def get_user_tier_with_days_left(user_id: int) -> tuple[str, int | None]:
-    """Возвращает (тариф, сколько дней осталось). Для free или владельца — (tier, None)."""
+    """Возвращает (тариф, сколько дней осталось). Для free, владельца или
+    lifetime-подписки — (tier, None)."""
     if user_id in OWNER_IDS:
         return "vip", None
     raw = await redis_command("GET", f"sub:{user_id}")
     if not raw:
         return "free", None
     sub = json.loads(raw)
+    if sub["expires"] == "lifetime":
+        return sub["tier"], None
     expires = date.fromisoformat(sub["expires"])
     days_left = (expires - date.today()).days
     if days_left < 0:
@@ -138,11 +143,17 @@ async def get_user_tier_with_days_left(user_id: int) -> tuple[str, int | None]:
     return sub["tier"], days_left
 
 
-async def grant_subscription(user_id: int, tier: str, days: int = SUBSCRIPTION_DAYS):
-    expires = date.today() + timedelta(days=days)
-    value = json.dumps({"tier": tier, "expires": expires.isoformat()})
-    # ключ живёт чуть дольше самой подписки — просто с запасом
-    await redis_command("SET", f"sub:{user_id}", value, "EX", str(days * 86400 + 86400))
+async def grant_subscription(user_id: int, tier: str, days: int | None = SUBSCRIPTION_DAYS):
+    """days=None означает lifetime — подписка без срока действия и без
+    автоудаления из Redis (TTL не ставится)."""
+    if days is None:
+        value = json.dumps({"tier": tier, "expires": "lifetime"})
+        await redis_command("SET", f"sub:{user_id}", value)  # без EX — хранится вечно
+    else:
+        expires = date.today() + timedelta(days=days)
+        value = json.dumps({"tier": tier, "expires": expires.isoformat()})
+        # ключ живёт чуть дольше самой подписки — просто с запасом
+        await redis_command("SET", f"sub:{user_id}", value, "EX", str(days * 86400 + 86400))
 
 
 async def check_and_increment_limit(user_id: int, kind: str, daily_limit: int) -> bool:
@@ -414,21 +425,24 @@ async def test_grant_subscription(message: types.Message):
 @dp.message(Command("grant"))
 async def grant_subscription_to_user(message: types.Message):
     """Команда только для владельца — выдаёт подписку любому пользователю
-    на любой срок (например, в подарок или по договорённости).
-    Использование: /grant <user_id> <premium|vip> <дней>
-    Пример: /grant 987654321 vip 7"""
+    на любой срок, или навсегда (lifetime).
+    Использование: /grant <user_id> <premium|vip> <дней|lifetime>
+    Примеры: /grant 987654321 vip 7
+             /grant 987654321 premium lifetime"""
     if message.from_user.id not in OWNER_IDS:
         return
 
     parts = message.text.split()
     if len(parts) != 4:
         await message.answer(
-            "Использование: /grant <user_id> <premium|vip> <дней>\n"
-            "Пример: /grant 987654321 vip 7"
+            "Использование: /grant <user_id> <premium|vip> <дней|lifetime>\n"
+            "Примеры:\n"
+            "/grant 987654321 vip 7\n"
+            "/grant 987654321 premium lifetime"
         )
         return
 
-    _, user_id_str, tier, days_str = parts
+    _, user_id_str, tier, duration_str = parts
 
     if tier not in ("premium", "vip"):
         await message.answer("Тариф должен быть premium или vip.")
@@ -436,9 +450,19 @@ async def grant_subscription_to_user(message: types.Message):
 
     try:
         target_user_id = int(user_id_str)
-        days = int(days_str)
     except ValueError:
-        await message.answer("user_id и количество дней должны быть числами.")
+        await message.answer("user_id должен быть числом.")
+        return
+
+    if duration_str.lower() == "lifetime":
+        await grant_subscription(target_user_id, tier, days=None)
+        await message.answer(f"Готово: пользователю {target_user_id} выдан тариф {tier} навсегда (lifetime).")
+        return
+
+    try:
+        days = int(duration_str)
+    except ValueError:
+        await message.answer("Количество дней должно быть числом, либо напиши lifetime.")
         return
 
     if days <= 0:
@@ -447,6 +471,35 @@ async def grant_subscription_to_user(message: types.Message):
 
     await grant_subscription(target_user_id, tier, days)
     await message.answer(f"Готово: пользователю {target_user_id} выдан тариф {tier} на {days} дн.")
+
+
+@dp.message(Command("revoke"))
+async def revoke_subscription(message: types.Message):
+    """Команда только для владельца — снимает подписку у пользователя
+    (удаляет запись из базы, работает и для lifetime, и для обычных).
+    Использование: /revoke <user_id>
+    Пример: /revoke 987654321"""
+    if message.from_user.id not in OWNER_IDS:
+        return
+
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Использование: /revoke <user_id>\nПример: /revoke 987654321")
+        return
+
+    try:
+        target_user_id = int(parts[1])
+    except ValueError:
+        await message.answer("user_id должен быть числом.")
+        return
+
+    existing = await redis_command("GET", f"sub:{target_user_id}")
+    if not existing:
+        await message.answer(f"У пользователя {target_user_id} и так нет активной подписки.")
+        return
+
+    await redis_command("DEL", f"sub:{target_user_id}")
+    await message.answer(f"Готово: подписка пользователя {target_user_id} снята.")
 
 
 @dp.message(Command("admin"))
