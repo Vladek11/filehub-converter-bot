@@ -7,15 +7,16 @@ VIP: всё из Premium + конвертация аудио, объединен
 
 Оплата — через Telegram Stars.
 
-ВАЖНО: подписки и лимиты хранятся в памяти процесса. При перезапуске
-сервиса (Render) эти данные обнуляются — это временное решение,
-для реальных денег нужно подключить постоянное хранилище (Redis и т.п.).
+Подписки и лимиты хранятся в Upstash Redis (постоянно, переживают
+перезапуски сервиса). Переменные окружения UPSTASH_REDIS_REST_URL
+и UPSTASH_REDIS_REST_TOKEN обязательны.
 
 Токен берётся из переменной окружения TELEGRAM_TOKEN.
 """
 
 import asyncio
 import io
+import json
 import logging
 import os
 import subprocess
@@ -23,6 +24,7 @@ import tempfile
 import uuid
 from datetime import date, timedelta
 
+import aiohttp
 from aiogram import Bot, Dispatcher, F, types
 from aiogram.filters import Command
 from aiogram.types import (
@@ -41,6 +43,9 @@ import pytesseract
 # ==== НАСТРОЙКИ ====
 TELEGRAM_TOKEN = os.environ["TELEGRAM_TOKEN"]
 PORT = int(os.environ.get("PORT", 8080))
+
+REDIS_URL = os.environ["UPSTASH_REDIS_REST_URL"]
+REDIS_TOKEN = os.environ["UPSTASH_REDIS_REST_TOKEN"]
 
 OWNER_IDS = {1745647417}  # владелец бота — VIP навсегда, без лимитов
 
@@ -65,41 +70,48 @@ dp = Dispatcher()
 pending_action: dict[int, str] = {}
 pending_merge_files: dict[int, list[bytes]] = {}
 
-# {user_id: (дата, счётчик)} — обычные конвертации
-usage_tracker: dict[int, tuple[date, int]] = {}
-# {user_id: (дата, счётчик)} — видео->аудио отдельно
-video_usage_tracker: dict[int, tuple[date, int]] = {}
 
-# {user_id: {"tier": "premium"/"vip", "expires": date}}
-subscriptions: dict[int, dict] = {}
+# ==== Redis (Upstash) — постоянное хранилище подписок и лимитов ====
+
+async def redis_command(*args) -> any:
+    """Выполняет одну команду Redis через REST API Upstash."""
+    headers = {"Authorization": f"Bearer {REDIS_TOKEN}"}
+    async with aiohttp.ClientSession() as session:
+        async with session.post(REDIS_URL, headers=headers, json=list(args)) as response:
+            data = await response.json()
+            return data.get("result")
 
 
-def get_user_tier(user_id: int) -> str:
+async def get_user_tier(user_id: int) -> str:
     if user_id in OWNER_IDS:
         return "vip"
-    sub = subscriptions.get(user_id)
-    if sub and sub["expires"] >= date.today():
+    raw = await redis_command("GET", f"sub:{user_id}")
+    if not raw:
+        return "free"
+    sub = json.loads(raw)
+    if date.fromisoformat(sub["expires"]) >= date.today():
         return sub["tier"]
     return "free"
 
 
-def grant_subscription(user_id: int, tier: str):
-    subscriptions[user_id] = {
-        "tier": tier,
-        "expires": date.today() + timedelta(days=SUBSCRIPTION_DAYS),
-    }
+async def grant_subscription(user_id: int, tier: str):
+    expires = date.today() + timedelta(days=SUBSCRIPTION_DAYS)
+    value = json.dumps({"tier": tier, "expires": expires.isoformat()})
+    # ключ живёт чуть дольше самой подписки — просто с запасом
+    await redis_command("SET", f"sub:{user_id}", value, "EX", str(SUBSCRIPTION_DAYS * 86400 + 86400))
 
 
-def check_and_increment_limit(user_id: int, tracker: dict, daily_limit: int) -> bool:
+async def check_and_increment_limit(user_id: int, kind: str, daily_limit: int) -> bool:
     if user_id in OWNER_IDS:
         return True
-    today = date.today()
-    last_date, count = tracker.get(user_id, (today, 0))
-    if last_date != today:
-        count = 0
-    if count >= daily_limit:
+    key = f"usage:{kind}:{user_id}:{date.today().isoformat()}"
+    current_raw = await redis_command("GET", key)
+    current = int(current_raw) if current_raw else 0
+    if current >= daily_limit:
         return False
-    tracker[user_id] = (today, count + 1)
+    new_count = await redis_command("INCR", key)
+    if new_count == 1:
+        await redis_command("EXPIRE", key, "172800")  # авто-очистка через 2 дня
     return True
 
 
@@ -283,8 +295,8 @@ def tariffs_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def main_menu_text(user_id: int) -> str:
-    tier = get_user_tier(user_id)
+async def main_menu_text(user_id: int) -> str:
+    tier = await get_user_tier(user_id)
     tier_names = {"free": "Бесплатный", "premium": "Premium 💎", "vip": "VIP 👑"}
     return (
         "Привет! 👋 Я конвертирую файлы.\n\n"
@@ -321,10 +333,6 @@ async def download_file_bytes(file_id: str) -> bytes:
     return file_bytes.read()
 
 
-def get_file_size_limit_mb(user_id: int) -> int:
-    return TIER_LIMITS[get_user_tier(user_id)]["max_size_mb"]
-
-
 # ==== Команды и меню ====
 
 @dp.message(Command("start"))
@@ -332,7 +340,7 @@ async def cmd_start(message: types.Message):
     user_id = message.from_user.id
     pending_action.pop(user_id, None)
     pending_merge_files.pop(user_id, None)
-    await message.answer(main_menu_text(user_id), reply_markup=main_menu_keyboard())
+    await message.answer(await main_menu_text(user_id), reply_markup=main_menu_keyboard())
 
 
 @dp.message(F.text == BTN_SUBSCRIPTION)
@@ -350,7 +358,7 @@ async def go_back(message: types.Message):
     user_id = message.from_user.id
     pending_action.pop(user_id, None)
     pending_merge_files.pop(user_id, None)
-    await message.answer(main_menu_text(user_id), reply_markup=main_menu_keyboard())
+    await message.answer(await main_menu_text(user_id), reply_markup=main_menu_keyboard())
 
 
 @dp.message(F.text == BTN_BUY_PREMIUM)
@@ -386,7 +394,7 @@ async def process_pre_checkout(pre_checkout: PreCheckoutQuery):
 async def process_successful_payment(message: types.Message):
     payload = message.successful_payment.invoice_payload
     tier = payload.replace("sub_", "")
-    grant_subscription(message.from_user.id, tier)
+    await grant_subscription(message.from_user.id, tier)
     tier_name = "Premium 💎" if tier == "premium" else "VIP 👑"
     await message.answer(
         f"Спасибо за покупку! Подписка {tier_name} активна на {SUBSCRIPTION_DAYS} дней. 🎉",
@@ -423,7 +431,7 @@ async def finish_merge(message: types.Message):
 async def select_action(message: types.Message):
     user_id = message.from_user.id
     action = BUTTON_TO_ACTION[message.text]
-    tier = get_user_tier(user_id)
+    tier = await get_user_tier(user_id)
 
     if not user_has_access(action, tier):
         needed = "VIP 👑" if action in VIP_ONLY_ACTIONS else "Premium 💎 или VIP 👑"
@@ -457,14 +465,14 @@ async def handle_image_upload(message: types.Message):
         await message.answer("Сначала выбери функцию в меню — напиши /start.")
         return
 
-    tier = get_user_tier(user_id)
+    tier = await get_user_tier(user_id)
     size_limit = TIER_LIMITS[tier]["max_size_mb"]
     if message.document and message.document.file_size > size_limit * 1024 * 1024:
         await message.answer(f"Файл больше {size_limit} МБ, не могу обработать.")
         return
 
     daily_limit = TIER_LIMITS[tier]["daily"]
-    if not check_and_increment_limit(user_id, usage_tracker, daily_limit):
+    if not await check_and_increment_limit(user_id, "usage", daily_limit):
         await message.answer(f"Дневной лимит ({daily_limit}) исчерпан. Попробуй завтра.")
         return
 
@@ -535,7 +543,7 @@ async def handle_pdf_upload(message: types.Message):
         await message.answer("Сначала выбери функцию в меню — напиши /start.")
         return
 
-    tier = get_user_tier(user_id)
+    tier = await get_user_tier(user_id)
     size_limit = TIER_LIMITS[tier]["max_size_mb"]
     if message.document.file_size > size_limit * 1024 * 1024:
         await message.answer(f"Файл больше {size_limit} МБ, не могу обработать.")
@@ -550,7 +558,7 @@ async def handle_pdf_upload(message: types.Message):
         return
 
     daily_limit = TIER_LIMITS[tier]["daily"]
-    if not check_and_increment_limit(user_id, usage_tracker, daily_limit):
+    if not await check_and_increment_limit(user_id, "usage", daily_limit):
         await message.answer(f"Дневной лимит ({daily_limit}) исчерпан. Попробуй завтра.")
         return
 
@@ -606,14 +614,14 @@ async def handle_docx_upload(message: types.Message):
         await message.answer("Сначала выбери функцию в меню — напиши /start.")
         return
 
-    tier = get_user_tier(user_id)
+    tier = await get_user_tier(user_id)
     size_limit = TIER_LIMITS[tier]["max_size_mb"]
     if message.document.file_size > size_limit * 1024 * 1024:
         await message.answer(f"Файл больше {size_limit} МБ, не могу обработать.")
         return
 
     daily_limit = TIER_LIMITS[tier]["daily"]
-    if not check_and_increment_limit(user_id, usage_tracker, daily_limit):
+    if not await check_and_increment_limit(user_id, "usage", daily_limit):
         await message.answer(f"Дневной лимит ({daily_limit}) исчерпан. Попробуй завтра.")
         return
 
@@ -642,7 +650,7 @@ async def handle_video_upload(message: types.Message):
         await message.answer("Сначала выбери функцию в меню — напиши /start.")
         return
 
-    tier = get_user_tier(user_id)
+    tier = await get_user_tier(user_id)
     size_limit = TIER_LIMITS[tier]["max_size_mb"]
     file_obj = message.video or message.document
     if file_obj.file_size > size_limit * 1024 * 1024:
@@ -650,7 +658,7 @@ async def handle_video_upload(message: types.Message):
         return
 
     video_limit = TIER_LIMITS[tier]["video_audio_daily"]
-    if not check_and_increment_limit(user_id, video_usage_tracker, video_limit):
+    if not await check_and_increment_limit(user_id, "video", video_limit):
         await message.answer(f"Дневной лимит на видео→аудио ({video_limit}) исчерпан. Попробуй завтра.")
         return
 
@@ -679,7 +687,7 @@ async def handle_audio_upload(message: types.Message):
         await message.answer("Сначала выбери функцию в меню — напиши /start.")
         return
 
-    tier = get_user_tier(user_id)
+    tier = await get_user_tier(user_id)
     size_limit = TIER_LIMITS[tier]["max_size_mb"]
     file_obj = message.audio or message.voice or message.document
     if file_obj.file_size > size_limit * 1024 * 1024:
@@ -687,7 +695,7 @@ async def handle_audio_upload(message: types.Message):
         return
 
     daily_limit = TIER_LIMITS[tier]["daily"]
-    if not check_and_increment_limit(user_id, usage_tracker, daily_limit):
+    if not await check_and_increment_limit(user_id, "usage", daily_limit):
         await message.answer(f"Дневной лимит ({daily_limit}) исчерпан. Попробуй завтра.")
         return
 
