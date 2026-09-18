@@ -343,6 +343,24 @@ async def cmd_start(message: types.Message):
     await message.answer(await main_menu_text(user_id), reply_markup=main_menu_keyboard())
 
 
+@dp.message(Command("test_grant"))
+async def test_grant_subscription(message: types.Message):
+    """Тестовая команда только для владельца — выдаёт подписку без оплаты,
+    чтобы проверить, что она сохраняется в Redis после перезапуска.
+    Использование: /test_grant premium  или  /test_grant vip"""
+    if message.from_user.id not in OWNER_IDS:
+        return
+
+    parts = message.text.split()
+    tier = parts[1] if len(parts) > 1 else "premium"
+    if tier not in ("premium", "vip"):
+        await message.answer("Использование: /test_grant premium  или  /test_grant vip")
+        return
+
+    await grant_subscription(message.from_user.id, tier)
+    await message.answer(f"Тестовая подписка {tier} выдана на {SUBSCRIPTION_DAYS} дней (в Redis).")
+
+
 @dp.message(F.text == BTN_SUBSCRIPTION)
 async def show_subscription(message: types.Message):
     await message.answer(SUBSCRIPTION_INFO_TEXT, reply_markup=subscription_info_keyboard())
